@@ -27,7 +27,7 @@ if "active_rain_uid" not in st.session_state:
     st.session_state.active_rain_uid = None
 
 if "delete_confirms" not in st.session_state:
-    st.session_state.delete_confirms = {}  # uid -> bool
+    st.session_state.delete_confirms = {}  # uid -> boolean
 
 # ---------- Helpers ----------
 def now_human():
