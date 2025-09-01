@@ -3,76 +3,158 @@ import streamlit as st
 from datetime import datetime, timedelta
 import pandas as pd
 import plotly.graph_objects as go
-import random, math, uuid
+import random, math
+import requests
+
+# ===================== CONFIG =====================
+API_BASE = "http://127.0.0.1:8000"  # FastAPI local
 
 st.set_page_config(page_title="Hydro Software Services App", layout="wide")
 st.title("Hydro Software Services App")
 
-# ---------- Session state ----------
-if "plants" not in st.session_state:
-    st.session_state.plants = []  # Each: {"uid","name","id","created_at","weather":{"name","id"}}
+# ===================== API HELPERS =====================
+# --- Stations ---
+def api_get_stations():
+    r = requests.get(f"{API_BASE}/stations", timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def api_create_station(weather_station_code: str, weather_station_name: str):
+    payload = {
+        "weather_station_code": weather_station_code.strip(),
+        "weather_station_name": weather_station_name.strip(),
+    }
+    r = requests.post(f"{API_BASE}/stations", json=payload, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def api_patch_station(code: str, new_name: str | None = None, new_code: str | None = None):
+    payload = {}
+    if new_name is not None:
+        payload["weather_station_name"] = new_name.strip()
+    if new_code is not None:
+        payload["new_weather_station_code"] = new_code.strip()
+    r = requests.patch(f"{API_BASE}/stations/{code}", json=payload, timeout=10)
+    if r.status_code == 409:
+        raise RuntimeError("A station with this new code already exists.")
+    r.raise_for_status()
+    return r.json()
+
+def api_delete_station(code: str):
+    r = requests.delete(f"{API_BASE}/stations/{code}", timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+# --- Plants ---
+def api_get_plants():
+    r = requests.get(f"{API_BASE}/plants", timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def api_create_plant(hpp_code: str, hpp_name: str, weather_station_id: int | None):
+    payload = {
+        "hpp_code": hpp_code.strip(),
+        "hpp_name": hpp_name.strip(),
+        "weather_station_id": weather_station_id,
+    }
+    r = requests.post(f"{API_BASE}/plants", json=payload, timeout=10)
+    if r.status_code == 409:
+        raise RuntimeError("A plant with this code already exists.")
+    r.raise_for_status()
+    return r.json()
+
+def api_patch_plant(
+    hpp_code: str,
+    hpp_name: str | None = None,
+    weather_station_id: int | None = None,
+    new_hpp_code: str | None = None,
+):
+    payload = {}
+    if hpp_name is not None:
+        payload["hpp_name"] = hpp_name.strip()
+    # on envoie toujours la clé, None => délinker (côté API plants.py)
+    payload["weather_station_id"] = weather_station_id
+    if new_hpp_code:
+        payload["new_hpp_code"] = new_hpp_code.strip()
+
+    r = requests.patch(f"{API_BASE}/plants/{hpp_code}", json=payload, timeout=10)
+    if r.status_code == 409:
+        raise RuntimeError("A plant with this new code already exists.")
+    r.raise_for_status()
+    return r.json()
+
+def api_delete_plant(hpp_code: str):
+    r = requests.delete(f"{API_BASE}/plants/{hpp_code}", timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+# ===================== STATE INIT =====================
 if "show_form" not in st.session_state:
     st.session_state.show_form = False
-if "new_name" not in st.session_state:
-    st.session_state.new_name = ""
-if "new_id" not in st.session_state:
-    st.session_state.new_id = ""
+if "show_station_form" not in st.session_state:
+    st.session_state.show_station_form = False
+
+if "stations" not in st.session_state:
+    st.session_state.stations = []
+if "plants_api" not in st.session_state:
+    st.session_state.plants_api = []
+
+if "active_prod_id" not in st.session_state:
+    st.session_state.active_prod_id = None
+if "active_rain_id" not in st.session_state:
+    st.session_state.active_rain_id = None
+
 if "open_actions" not in st.session_state:
-    st.session_state.open_actions = {}  # uid -> bool (actions panel open/closed)
+    st.session_state.open_actions = {}
 
-# NEW: which plant drives the center chart (production) and optional rain overlay
-if "active_prod_uid" not in st.session_state:
-    st.session_state.active_prod_uid = None
-if "active_rain_uid" not in st.session_state:
-    st.session_state.active_rain_uid = None
+if "confirm_plant_delete_code" not in st.session_state:
+    st.session_state.confirm_plant_delete_code = None
+if "confirm_ws_delete_code" not in st.session_state:
+    st.session_state.confirm_ws_delete_code = None
 
-if "delete_confirms" not in st.session_state:
-    st.session_state.delete_confirms = {}  # uid -> boolean
+def refresh_from_api():
+    try:
+        st.session_state.stations = api_get_stations()
+    except Exception as e:
+        st.warning(f"Could not load stations: {e}")
+    try:
+        st.session_state.plants_api = api_get_plants()
+    except Exception as e:
+        st.warning(f"Could not load plants: {e}")
 
-# ---------- Helpers ----------
-def now_human():
-    return datetime.now().strftime("%d-%m-%Y at %H:%M:%S")
+# Bandeau de confirmation suppression Station (reste visible même si le popover s’est refermé)
+if st.session_state.get("confirm_ws_delete_code"):
+    code = st.session_state["confirm_ws_delete_code"]
+    with st.container(border=True):
+        st.warning(f"Delete weather station `{code}` ? Linked plants will be unlinked (FK SET NULL).")
+        c1, c2 = st.columns(2)
+        if c1.button("Yes, delete", use_container_width=True, key="ws_del_yes"):
+            try:
+                api_delete_station(code)
+                st.toast("Station deleted.", icon="🗑️")
+                st.session_state["confirm_ws_delete_code"] = None
+                refresh_from_api()
+                st.rerun()
+            except Exception as e:
+                st.error(f"API error: {e}")
+        if c2.button("Cancel", use_container_width=True, key="ws_del_no"):
+            st.session_state["confirm_ws_delete_code"] = None
+            st.rerun()
 
-def add_plant(name: str, pid: str):
-    st.session_state.plants.append({
-        "uid": str(uuid.uuid4()),
-        "name": name.strip(),
-        "id": pid.strip(),
-        "created_at": now_human(),
-        "weather": {"name": "", "id": ""}
-    })
+# premier chargement
+if not st.session_state.stations or not st.session_state.plants_api:
+    refresh_from_api()
 
-def get_plant_by_uid(uid: str):
-    for p in st.session_state.plants:
-        if p["uid"] == uid:
-            return p
-    return None
+# ===================== HELPERS =====================
+def station_label_from_id(stations: list[dict], ws_id: int | None) -> str:
+    if not ws_id:
+        return "—"
+    s = next((x for x in stations if x["id"] == ws_id), None)
+    if not s:
+        return f"id={ws_id}"
+    return f"{s['weather_station_code']} ({s['weather_station_name']})"
 
-def delete_plant_by_uid(uid: str):
-    st.session_state.plants = [p for p in st.session_state.plants if p["uid"] != uid]
-    st.session_state.delete_confirms.pop(uid, None)
-    st.session_state.open_actions.pop(uid, None)
-    # Clear selections if they pointed to this plant
-    if st.session_state.active_prod_uid == uid:
-        st.session_state.active_prod_uid = None
-    if st.session_state.active_rain_uid == uid:
-        st.session_state.active_rain_uid = None
-
-def save_weather(uid: str, ws_name: str, ws_id: str):
-    p = get_plant_by_uid(uid)
-    if not p: return
-    p["weather"]["name"] = ws_name.strip()
-    p["weather"]["id"] = ws_id.strip()
-
-def modify_plant(uid: str, new_name: str, new_id: str, ws_name: str, ws_id: str):
-    p = get_plant_by_uid(uid)
-    if not p: return
-    p["name"] = new_name.strip()
-    p["id"] = new_id.strip()
-    p["weather"]["name"] = ws_name.strip()
-    p["weather"]["id"] = ws_id.strip()
-    # Do not auto-toggle production/rain here
-
+# ===================== DUMMY SERIES (provisoirement) =====================
 def date_window_last_30_to_yesterday():
     today = datetime.now().date()
     end = today - timedelta(days=1)
@@ -80,7 +162,6 @@ def date_window_last_30_to_yesterday():
     return pd.date_range(start, end, freq="D")
 
 def placeholder_production_series(idx: pd.DatetimeIndex):
-    # Dummy kWh shape
     base, amp = 1200.0, 300.0
     day0 = idx[0].to_pydatetime().toordinal()
     vals, rnd = [], random.Random(42)
@@ -95,9 +176,12 @@ def placeholder_rain_series(idx: pd.DatetimeIndex, seed_text: str):
     vals = []
     for _ in range(len(idx)):
         r = rnd.random()
-        if r < 0.1: vals.append(round(rnd.uniform(8, 20), 1))
-        elif r < 0.4: vals.append(round(rnd.uniform(0.5, 5), 1))
-        else: vals.append(0.0)
+        if r < 0.1:
+            vals.append(round(rnd.uniform(8, 20), 1))
+        elif r < 0.4:
+            vals.append(round(rnd.uniform(0.5, 5), 1))
+        else:
+            vals.append(0.0)
     return pd.Series(vals, index=idx, name="Rain (mm)")
 
 def build_fig(prod: pd.Series, rain: pd.Series | None):
@@ -111,165 +195,234 @@ def build_fig(prod: pd.Series, rain: pd.Series | None):
         yaxis_title="kWh",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         yaxis2=dict(title="Rain (mm)", overlaying="y", side="right", rangemode="tozero"),
-        bargap=0.15, hovermode="x unified", height=460
+        bargap=0.15,
+        hovermode="x unified",
+        height=460,
     )
     return fig
 
-# ---------- Layout ----------
-center, right = st.columns([2.4, 1.2], gap="large")
+# ===================== LAYOUT =====================
+left, right = st.columns([2.4, 1.2], gap="large")
 
-# CENTER-LEFT: Chart (only if a plant is “shown”)
-with center:
+# -------- LEFT: Chart --------
+with left:
     st.subheader("Plant production")
-    if st.session_state.active_prod_uid is None:
-        st.info("No plant selected yet. Use “⋯ → Show hydro power plant production” on a plant to display the chart.")
+    if st.session_state.active_prod_id is None:
+        st.info("No plant selected yet. Open actions on a plant → “Show hydro power plant production”.")
     else:
+        plant = next((p for p in st.session_state.plants_api if p["id"] == st.session_state.active_prod_id), None)
         idx = date_window_last_30_to_yesterday()
         prod = placeholder_production_series(idx)
-
         rain = None
-        if st.session_state.active_rain_uid == st.session_state.active_prod_uid:
-            active = get_plant_by_uid(st.session_state.active_rain_uid)
-            if active:
-                rain = placeholder_rain_series(idx, seed_text=active["id"])
-
+        if plant and st.session_state.active_rain_id == plant["id"]:
+            # temporaire : pluie simulée tant que /rain n’est pas branché dans l’UI
+            rain = placeholder_rain_series(idx, seed_text=plant["hpp_code"])
         st.plotly_chart(build_fig(prod, rain), use_container_width=True)
-        p = get_plant_by_uid(st.session_state.active_prod_uid)
-        if p:
-            ws = p["weather"]
-            ws_text = f"Weather station: {ws['name']} ({ws['id']})" if (ws['name'] or ws['id']) else "Weather station: —"
-            st.caption(f"Window: last 30 days up to yesterday • Showing: **{p['name']}** (ID `{p['id']}`) • {ws_text}")
-        else:
-            st.caption("Window: last 30 days up to yesterday.")
+        if plant:
+            ws_text = f"Weather station: {station_label_from_id(st.session_state.stations, plant['weather_station_id'])}"
+            st.caption(
+                f"Window: last 30 days up to yesterday • Showing: **{plant['hpp_name']}** "
+                f"(Code `{plant['hpp_code']}` • DB id {plant['id']}) • {ws_text}"
+            )
 
-# RIGHT: Add (top) + Saved (bottom)
+# -------- RIGHT: Forms & lists --------
 with right:
-    # Top-right: Add form
+    # --- Create plant (FIRST) ---
     st.subheader("Add a power plant")
     if st.button("➕ Add a power plant", use_container_width=True, key="btn_add_open"):
         st.session_state.show_form = True
     if st.session_state.show_form:
         with st.form(key="create_plant_form", border=True):
             st.markdown("**Create a new Hydropower Plant**")
-            name = st.text_input("Hydro Power Plant name", value=st.session_state.new_name,
+            name = st.text_input("Hydro Power Plant name",
                                  placeholder="e.g., Breuchin Small Hydro #1", key="new_plant_name")
-            pid = st.text_input("Hydro Power Plant id", value=st.session_state.new_id,
-                                placeholder="e.g., HPP-0001", key="new_plant_id")
+            code = st.text_input("Hydro Power Plant code",
+                                 placeholder="e.g., HPP-0001", key="new_plant_code")
+
+            station_options = ["(no station)"] + [
+                f"{s['id']} — {s['weather_station_code']} — {s['weather_station_name']}"
+                for s in st.session_state.stations
+            ]
+            choice = st.selectbox("Link to weather station (optional)", station_options, index=0)
+            chosen_station_id = None if choice == "(no station)" else int(choice.split(" — ", 1)[0])
+
             if st.form_submit_button("Save", use_container_width=True):
-                if not name.strip() or not pid.strip():
-                    st.error("Both fields are required.")
-                elif any(p["id"].lower() == pid.strip().lower() for p in st.session_state.plants):
-                    st.warning("A plant with this ID already exists.")
+                if not name.strip() or not code.strip():
+                    st.error("Both name and code are required.")
                 else:
-                    add_plant(name, pid)
-                    st.success(f"Plant **{name}** (ID: {pid}) saved locally.")
-                    st.session_state.new_name = ""
-                    st.session_state.new_id = ""
-                    st.session_state.show_form = False
-                    st.rerun()
+                    try:
+                        res = api_create_plant(hpp_code=code, hpp_name=name,
+                                               weather_station_id=chosen_station_id)
+                        st.success(f"Plant saved in DB (id={res.get('id')}).")
+                        st.session_state.show_form = False
+                        refresh_from_api()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"API error: {e}")
 
     st.divider()
 
-    # Bottom-right: List
-    st.subheader("Saved plants")
-    if not st.session_state.plants:
+    # --- Create station (SECOND) ---
+    st.subheader("Add a weather station")
+    if st.button("➕ Add a weather station", use_container_width=True, key="btn_add_station_open"):
+        st.session_state.show_station_form = True
+    if st.session_state.get("show_station_form", False):
+        with st.form(key="create_station_form", border=True):
+            st.markdown("**Create a new Weather Station**")
+            ws_code = st.text_input("Weather station **numeric id** (Météo-France)", placeholder="e.g., 70473001")
+            ws_name = st.text_input("Weather station **name**", placeholder="e.g., Luxeuil")
+            if st.form_submit_button("Save station", use_container_width=True):
+                if not ws_code.strip() or not ws_name.strip():
+                    st.error("Both code and name are required.")
+                else:
+                    try:
+                        res = api_create_station(ws_code, ws_name)
+                        st.success(f"Station saved (status={res.get('status')}, id={res.get('id')}).")
+                        st.session_state.show_station_form = False
+                        refresh_from_api()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"API error: {e}")
+
+    st.divider()
+
+    # --- Manage stations (popover) ---
+    with st.popover("Manage weather stations"):
+        st.write("All registered weather stations.")
+        if not st.session_state.stations:
+            st.info("No stations yet.")
+        else:
+            for s in st.session_state.stations:
+                code = s["weather_station_code"]
+                name = s["weather_station_name"]
+                with st.container(border=True):
+                    st.caption(f"Code: `{code}` • DB id: {s['id']}")
+                    c1, c2 = st.columns(2)
+                    new_name = c1.text_input(f"Name — {code}", value=name, key=f"ws_edit_name_{code}")
+                    new_code = c2.text_input(f"Code — {code}", value=code, key=f"ws_edit_code_{code}")
+                    b1, b2 = st.columns([0.6, 0.4])
+                    if b1.button("Save changes", key=f"ws_save_{code}", use_container_width=True):
+                        try:
+                            code_change = new_code.strip() if new_code.strip() != code else None
+                            api_patch_station(code, new_name=new_name, new_code=code_change)
+                            st.success("Station updated.")
+                            refresh_from_api()
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"API error: {e}")
+                    if b2.button("Delete", key=f"ws_del_{code}", use_container_width=True):
+                        st.session_state.confirm_ws_delete_code = code
+                        st.rerun()
+
+    st.divider()
+
+    # --- List plants (from DB) + actions ---
+    st.subheader("Saved plants (from DB)")
+    if not st.session_state.plants_api:
         st.info("No plants yet.")
     else:
-        for p in st.session_state.plants:
-            uid = p["uid"]
-            if uid not in st.session_state.open_actions:
-                st.session_state.open_actions[uid] = False
-
+        for p in st.session_state.plants_api:
+            pid = p["id"]  # PK interne
+            st.session_state.open_actions.setdefault(pid, False)
             with st.container(border=True):
                 top = st.columns([0.85, 0.15])
                 with top[0]:
-                    st.markdown(f"**{p['name']}**")
-                    st.caption(f"ID: `{p['id']}` • Added: {p['created_at']}")
-                    ws = p["weather"]
-                    ws_line = "Weather station: "
-                    if ws["name"] or ws["id"]:
-                        ws_line += f"{ws['name']} ({ws['id']})"
-                    st.write(ws_line)
+                    st.markdown(f"**{p['hpp_name']}**")
+                    st.caption(f"Code: `{p['hpp_code']}` • DB id: {p['id']}")
+                    st.write(f"Weather station: {station_label_from_id(st.session_state.stations, p['weather_station_id'])}")
                 with top[1]:
-                    # Small icon-like button "⋯" to toggle actions panel
-                    if st.button("⋯", key=f"toggle_actions_{uid}", use_container_width=True):
-                        st.session_state.open_actions[uid] = not st.session_state.open_actions[uid]
+                    if st.button("⋯", key=f"toggle_actions_{pid}", use_container_width=True):
+                        st.session_state.open_actions[pid] = not st.session_state.open_actions[pid]
                         st.rerun()
 
-                # Actions panel
-                if st.session_state.open_actions[uid]:
+                if st.session_state.open_actions[pid]:
                     with st.container(border=True):
                         st.markdown("**Actions**")
 
-                        # Show/Hide production (controls the center chart)
-                        show_prod = (st.session_state.active_prod_uid == uid)
+                        # Show/Hide production
+                        show_prod = (st.session_state.active_prod_id == pid)
                         prod_label = "Hide hydro power plant production" if show_prod else "Show hydro power plant production"
-                        if st.button(prod_label, use_container_width=True, key=f"show_prod_{uid}"):
-                            st.session_state.active_prod_uid = None if show_prod else uid
-                            # If we hide production, also hide rain for that plant
-                            if st.session_state.active_prod_uid is None and st.session_state.active_rain_uid == uid:
-                                st.session_state.active_rain_uid = None
+                        if st.button(prod_label, use_container_width=True, key=f"show_prod_{pid}"):
+                            st.session_state.active_prod_id = None if show_prod else pid
+                            if st.session_state.active_prod_id is None and st.session_state.active_rain_id == pid:
+                                st.session_state.active_rain_id = None
                             st.rerun()
 
-                        # Add weather station
-                        with st.expander("Add weather station", expanded=False):
-                            ws_name = st.text_input(f"Weather station name {uid}",
-                                                    value=p['weather']['name'],
-                                                    placeholder="e.g., Meteo Breuchin",
-                                                    key=f"ws_name_{uid}")
-                            ws_id = st.text_input(f"Weather station id {uid}",
-                                                  value=p['weather']['id'],
-                                                  placeholder="e.g., WS-001",
-                                                  key=f"ws_id_{uid}")
-                            if st.button("Save weather station", use_container_width=True, key=f"ws_save_{uid}"):
-                                save_weather(uid, ws_name, ws_id)
-                                st.success("Weather station saved.")
-                                st.rerun()
-
-                        # Modify plant + weather
-                        with st.expander("Modify", expanded=False):
-                            new_name = st.text_input(f"Plant name {uid}", value=p["name"], key=f"plant_name_{uid}")
-                            new_id = st.text_input(f"Plant id {uid}", value=p["id"], key=f"plant_id_{uid}")
-                            new_ws_name = st.text_input(f"Weather station name (edit) {uid}",
-                                                        value=p["weather"]["name"], key=f"plant_ws_name_{uid}")
-                            new_ws_id = st.text_input(f"Weather station id (edit) {uid}",
-                                                      value=p["weather"]["id"], key=f"plant_ws_id_{uid}")
-                            if st.button("Save changes", use_container_width=True, key=f"plant_save_{uid}"):
-                                if not new_name.strip() or not new_id.strip():
-                                    st.error("Plant name and id are required.")
-                                elif any(other["uid"] != uid and other["id"].lower() == new_id.strip().lower()
-                                         for other in st.session_state.plants):
-                                    st.warning("Another plant already uses this ID.")
-                                else:
-                                    # If this plant is currently driving the rain overlay, and ID changes,
-                                    # keep overlay by uid (we use uid for state, so it's fine). Nothing to do.
-                                    modify_plant(uid, new_name, new_id, new_ws_name, new_ws_id)
-                                    st.success("Plant updated.")
-                                    st.rerun()
-
-                        # Show / Hide rain overlay (requires a production plant shown)
-                        is_rain_on = (st.session_state.active_rain_uid == uid)
+                        # Show / Hide rain overlay (dummy until real /rain hookup)
+                        is_rain_on = (st.session_state.active_rain_id == pid)
                         rain_label = "Hide rain data" if is_rain_on else "Show rain data"
-                        if st.button(rain_label, use_container_width=True, key=f"toggle_rain_{uid}"):
-                            if st.session_state.active_prod_uid != uid:
+                        if st.button(rain_label, use_container_width=True, key=f"toggle_rain_{pid}"):
+                            if st.session_state.active_prod_id != pid:
                                 st.toast("Show the plant production first, then overlay rain.", icon="ℹ️")
                             else:
-                                st.session_state.active_rain_uid = None if is_rain_on else uid
+                                st.session_state.active_rain_id = None if is_rain_on else pid
                                 st.rerun()
 
-                        # Delete with confirmation
-                        confirm = st.session_state.delete_confirms.get(uid, False)
-                        if not confirm:
-                            if st.button("Delete", type="secondary", use_container_width=True, key=f"del_{uid}"):
-                                st.session_state.delete_confirms[uid] = True
+                        # ---- Edit (PATCH name + code + station) ----
+                        with st.expander("Edit plant", expanded=False):
+                            new_name = st.text_input(
+                                f"Plant name (edit) — {p['hpp_code']}",
+                                value=p["hpp_name"], key=f"edit_name_{pid}"
+                            )
+                            new_code = st.text_input(
+                                f"Plant code (edit) — {p['hpp_code']}",
+                                value=p["hpp_code"], key=f"edit_code_{pid}"
+                            )
+
+                            station_options2 = ["(no station)"] + [
+                                f"{s['id']} — {s['weather_station_code']} — {s['weather_station_name']}"
+                                for s in st.session_state.stations
+                            ]
+                            if p.get("weather_station_id"):
+                                pre_label = None
+                                for s in st.session_state.stations:
+                                    if s["id"] == p["weather_station_id"]:
+                                        pre_label = f"{s['id']} — {s['weather_station_code']} — {s['weather_station_name']}"
+                                        break
+                                idx_pre = station_options2.index(pre_label) if pre_label in station_options2 else 0
+                            else:
+                                idx_pre = 0
+
+                            choice2 = st.selectbox(
+                                "Linked weather station", station_options2, index=idx_pre, key=f"edit_station_{pid}"
+                            )
+                            chosen_station_id2 = None if choice2 == "(no station)" else int(choice2.split(" — ", 1)[0])
+
+                            if st.button("Save changes", use_container_width=True, key=f"save_edit_{pid}"):
+                                try:
+                                    api_patch_plant(
+                                        hpp_code=p["hpp_code"],
+                                        hpp_name=new_name if new_name.strip() != p["hpp_name"] else None,
+                                        weather_station_id=chosen_station_id2,
+                                        new_hpp_code=new_code.strip() if new_code.strip() != p["hpp_code"] else None,
+                                    )
+                                    st.success("Plant updated.")
+                                    refresh_from_api()
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"API error: {e}")
+
+                        # ---- Delete plant (DELETE) avec confirmation persistante ----
+                        if st.session_state.confirm_plant_delete_code == p["hpp_code"]:
+                            st.warning("Confirm delete this plant?")
+                            c1, c2 = st.columns(2)
+                            if c1.button("Yes, delete", use_container_width=True, key=f"confirm_yes_{pid}"):
+                                try:
+                                    api_delete_plant(p["hpp_code"])
+                                    st.toast("Plant deleted.", icon="🗑️")
+                                    if st.session_state.active_prod_id == pid:
+                                        st.session_state.active_prod_id = None
+                                    if st.session_state.active_rain_id == pid:
+                                        st.session_state.active_rain_id = None
+                                    st.session_state.confirm_plant_delete_code = None
+                                    refresh_from_api()
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"API error: {e}")
+                            if c2.button("Cancel", use_container_width=True, key=f"confirm_no_{pid}"):
+                                st.session_state.confirm_plant_delete_code = None
                                 st.rerun()
                         else:
-                            st.warning("Confirm delete?")
-                            c1, c2 = st.columns(2)
-                            if c1.button("Yes, delete", use_container_width=True, key=f"yes_{uid}"):
-                                delete_plant_by_uid(uid)
-                                st.toast("Plant deleted.", icon="🗑️")
-                                st.rerun()
-                            if c2.button("Cancel", use_container_width=True, key=f"no_{uid}"):
-                                st.session_state.delete_confirms[uid] = False
+                            if st.button("Delete", type="secondary", use_container_width=True, key=f"del_{pid}"):
+                                st.session_state.confirm_plant_delete_code = p["hpp_code"]
                                 st.rerun()
